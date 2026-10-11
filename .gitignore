@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.pyc
+ledger.json
+fetch_orders.py
+.env
