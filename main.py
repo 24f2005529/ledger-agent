@@ -1,4 +1,3 @@
-
 import calendar
 import json
 import re
@@ -340,7 +339,7 @@ def answer_question(question: str) -> Any:
     group_field = None
 
     if re.search(
-        r"\bby products?\b|\bper products?\b|\beach products?\b|"
+        r"\b(?:top|bottom)\s+\d+\s+products?\b|\bby products?\b|\bper products?\b|\beach products?\b|"
         r"\bwhich products?\b|\btop products?\b|"
         r"\bbest[- ]selling products?\b|\bproduct[- ]wise\b",
         q,
@@ -348,7 +347,7 @@ def answer_question(question: str) -> Any:
         group_field = "product"
 
     elif re.search(
-        r"\bby customers?\b|\bper customers?\b|\beach customers?\b|"
+        r"\b(?:top|bottom)\s+\d+\s+customers?\b|\bby customers?\b|\bper customers?\b|\beach customers?\b|"
         r"\bwhich customers?\b|\btop customers?\b|"
         r"\bhighest[- ]spending customers?\b|\bcustomer[- ]wise\b",
         q,
@@ -356,7 +355,7 @@ def answer_question(question: str) -> Any:
         group_field = "customer"
 
     elif re.search(
-        r"\bby regions?\b|\bper regions?\b|\beach regions?\b|"
+        r"\b(?:top|bottom)\s+\d+\s+regions?\b|\bby regions?\b|\bper regions?\b|\beach regions?\b|"
         r"\bwhich regions?\b|\btop regions?\b|\bregion[- ]wise\b",
         q,
     ):
@@ -408,24 +407,29 @@ def answer_question(question: str) -> Any:
             for key, value in buckets.items()
         }
 
-        if re.search(
-            r"\b(top|highest|most|best|largest|greatest)\b",
+        top_n = re.search(r"\b(?:top|bottom)\s+(\d+)\b", q)
+        wants_min = re.search(
+            r"\b(lowest|least|fewest|smallest|worst|minimum|bottom)\b",
             q,
-        ):
-            key = max(group_values, key=group_values.get)
-            value = group_values[key]
+        )
+        wants_max = re.search(
+            r"\b(top|highest|most|best|largest|greatest|biggest|maximum)\b",
+            q,
+        )
 
-            numeric_value = (
-                int(value)
-                if measure in ("count", "quantity")
-                and float(value).is_integer()
-                else round(value, 2)
+        if top_n or wants_min or wants_max:
+            # "Which product ...?" asks for the name itself, so return the
+            # plain name (as the API spells it), not an object with a value.
+            ordered = sorted(
+                group_values,
+                key=lambda k: (group_values[k], k),
+                reverse=not wants_min,
             )
 
-            return {
-                "name": key,
-                "value": numeric_value,
-            }
+            if top_n:
+                return ordered[: int(top_n.group(1))]
+
+            return ordered[0]
 
         return {
             key: (
