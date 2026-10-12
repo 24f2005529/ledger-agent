@@ -235,10 +235,13 @@ def ask_llm(question, err=None):
             {"role": "user", "content": f"DATA SUMMARY:\n{SUMMARY[:9000]}\n\nQUESTION: {question}"}]
     if err:
         msgs.append({"role": "user", "content": f"Your previous code failed: {err}\nFix it."})
-    r = requests.post(f"{BASE}/chat/completions", timeout=12,
+    r = requests.post(f"{BASE}/chat/completions", timeout=9,
                       headers={"Authorization": f"Bearer {KEY}"},
                       json={"model": MODEL, "messages": msgs, "temperature": 0})
-    code = r.json()["choices"][0]["message"]["content"]
+    j = r.json()
+    if "choices" not in j:
+        raise RuntimeError("LLM API error: " + json.dumps(j)[:300])
+    code = j["choices"][0]["message"]["content"]
     return re.sub(r"^```(?:python)?|```$", "", code.strip(), flags=re.M).strip()
 
 
@@ -250,15 +253,19 @@ def run(code):
 
 
 def clean(x):
-    try:
-        import numpy as np
-        if isinstance(x, (np.integer,)): return int(x)
-        if isinstance(x, (np.floating,)): x = float(x)
-    except Exception:
-        pass
-    if isinstance(x, float):
-        return int(x) if x.is_integer() and abs(x) > 1e9 else round(x, 2)
-    if hasattr(x, "tolist"): return x.tolist()
+    import numpy as np, pandas as pd
+    if isinstance(x, pd.DataFrame):
+        x = x.iloc[:, 0] if x.shape[1] == 1 else x.to_dict("records")
+    if isinstance(x, pd.Series):
+        x = x.index[0] if len(x) == 1 and x.index.dtype == object and not isinstance(x.iloc[0], str) else (x.iloc[0] if len(x) == 1 else x.to_dict())
+    if isinstance(x, (np.bool_,)): return bool(x)
+    if isinstance(x, (np.integer,)): return int(x)
+    if isinstance(x, (np.floating,)): x = float(x)
+    if isinstance(x, np.str_): return str(x)
+    if isinstance(x, float): return round(x, 2)
+    if isinstance(x, (pd.Timestamp,)): return str(x)
+    if isinstance(x, (list, tuple)): return [clean(i) for i in x]
+    if isinstance(x, dict): return {str(k): clean(v) for k, v in x.items()}
     return x
 
 
@@ -281,16 +288,27 @@ def debug():
     return {"summary": SUMMARY}
 
 
+def solve(q):
+    if DF is None:
+        load()
+    err, code = None, None
+    for _ in range(2):
+        try:
+            code = ask_llm(q, err)
+            return {"answer": clean(run(code))}, code
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"[:400]
+    return {"answer": None, "error": err}, code
+
+
 @app.post("/answer")
 @app.post("/")
 async def answer(req: Request):
     q = (await req.json()).get("question", "")
-    if DF is None:
-        load()
-    err = None
-    for _ in range(2):
-        try:
-            return {"answer": clean(run(ask_llm(q, err)))}
-        except Exception as e:
-            err = repr(e)[:300]
-    return {"answer": None, "error": err}
+    return solve(q)[0]
+
+
+@app.get("/ask")
+def ask(q: str):
+    out, code = solve(q)
+    return {**out, "code": code}
