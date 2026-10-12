@@ -320,6 +320,8 @@ def find_region(question: str) -> str | None:
 
 def rule_answer(question: str) -> Any:
     q = question.lower().strip()
+    # "at least one", "at most 3" are thresholds, not rankings
+    q = re.sub(r"\bat\s+(?:least|most)\b", "at_threshold", q)
 
     if not q:
         raise ValueError("Please provide a question.")
@@ -339,14 +341,14 @@ def rule_answer(question: str) -> Any:
         re.search(
             r"\bhow many\s+"
             r"(?:(?:paid|refunded|voided?|cancelled?|canceled?|"
-            r"total|overall|distinct|unique)\s+)*"
+            r"total|overall|distinct|unique|different|separate|individual)\s+)*"
             r"(?:orders?|customers?|refunds?)\b",
             q,
         )
         or re.search(
             r"\b(?:count|number)\s+of\s+"
             r"(?:(?:paid|refunded|voided?|cancelled?|canceled?|"
-            r"total|overall|distinct|unique)\s+)*"
+            r"total|overall|distinct|unique|different|separate|individual)\s+)*"
             r"(?:orders?|customers?|refunds?)\b",
             q,
         )
@@ -383,9 +385,10 @@ def rule_answer(question: str) -> Any:
 
     customer_count_query = bool(
         re.search(
-            r"\bhow many customers?\b|"
+            r"\bhow many (?:(?:different|distinct|unique|separate|individual) )?"
+            r"customers?\b|"
             r"\b(?:number|count) of "
-            r"(?:distinct |unique )?customers?\b",
+            r"(?:(?:different|distinct|unique|separate|individual) )?customers?\b",
             q,
         )
     )
@@ -449,7 +452,7 @@ def rule_answer(question: str) -> Any:
 
             if (
                 not refund_query
-                and re.search(r"\bpaid\b", q)
+                and re.search(r"\b(?:paid|bought|purchased)\b", q)
                 and status != "paid"
             ):
                 continue
@@ -531,7 +534,11 @@ def rule_answer(question: str) -> Any:
         q,
     )
 
-    if group_field is None and rank_cue:
+    is_how_many = re.search(r"\bhow many\b|\b(?:number|count) of\b", q) and not re.search(
+        r"\b(which|who|top|most|highest|best|lowest|fewest)\b", q
+    )
+
+    if group_field is None and rank_cue and not is_how_many:
         if re.search(r"\b(customers?|buyers?|clients?|who)\b", q):
             if not customer_match:
                 group_field = "customer"
@@ -683,8 +690,11 @@ Business rules:
 - Money results: float rounded to 2 decimals. Counts: int. For "top/best" questions return the name string
   (or a number if they ask for the amount). Use `result` as a plain Python number/string (or list/dict if multiple).
 - Quantity questions ("units sold") use sum of qty over paid orders unless stated otherwise.
-- Ranking wording such as top, best, top-selling, best-selling, biggest, highest, most, leading, lowest, least
-  means: group, rank, and return ONLY the single winning name string (customer ids look like 'C1067'),
+- "at least" / "at most" / "no more than" are thresholds, NOT rankings. "How many ..." (including "how many
+  different/distinct customers ...") asks for a COUNT: return an int, e.g. df[mask]['customer'].nunique() for
+  distinct customers. "Placed a paid order for X" means status == 'paid' and product == X.
+- Ranking wording such as top, best, top-selling, best-selling, biggest, highest, most (as in "which ... most"),
+  leading, lowest, fewest means: group, rank, and return ONLY the single winning name string (customer ids look like 'C1067'),
   unless the question asks for the amount/value too or for 'top N' (then a list of names). "Top-selling"
   or "best seller" by revenue (or with no measure given) ranks by paid USD revenue; "units" ranks by paid qty.
 - Always set `result`. It must be a plain str/int/float/list/dict, never a Series or DataFrame.
