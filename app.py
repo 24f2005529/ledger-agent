@@ -149,45 +149,90 @@ def shape(v, depth=0):
     return type(v).__name__
 
 
-DATA, SUMMARY = {}, ""
+DATA, SUMMARY, DF = {}, "", None
+RATES = {"USD": 1.0}
+
+
+def build_df():
+    import pandas as pd
+    rows = []
+    for lab, v in DATA.items():
+        if lab.startswith("/orders") and isinstance(v, dict):
+            rows += v.get("orders", [])
+        elif lab.startswith("/export"):
+            if isinstance(v, list):
+                rows += v
+            elif isinstance(v, str):
+                for line in v.splitlines():
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            pass
+    rates = (DATA.get("/rates") or {}).get("usd_per_unit", {})
+    RATES.update({k: float(x) for k, x in rates.items()})
+    df = pd.DataFrame(rows)
+    for c in ("id", "customer", "region", "product", "currency", "status"):
+        df[c] = df[c].astype(str).str.strip()
+    df["status"] = df["status"].str.lower()
+    df["currency"] = df["currency"].str.upper()
+    df["_upd"] = pd.to_datetime(df["updated_at"], utc=True, format="ISO8601")
+    df = df.sort_values("_upd", kind="stable").drop_duplicates("id", keep="last").drop(columns="_upd")
+    cr = pd.to_datetime(df["created_at"], utc=True, format="ISO8601").dt.tz_convert("Asia/Kolkata")
+    up = pd.to_datetime(df["updated_at"], utc=True, format="ISO8601").dt.tz_convert("Asia/Kolkata")
+    df["created_ist"], df["updated_ist"] = cr, up
+    df["month"] = cr.dt.strftime("%Y-%m")
+    df["date"] = cr.dt.strftime("%Y-%m-%d")
+    df["updated_month"] = up.dt.strftime("%Y-%m")
+    df["usd"] = df["amount"] * df["currency"].map(RATES)
+    return df.reset_index(drop=True)
 
 
 def load():
-    global DATA, SUMMARY
+    global DATA, SUMMARY, DF
     DATA = crawl()
-    root = DATA.get("/")
-    lines = [f"{len(DATA)} responses crawled."]
-    if isinstance(root, dict):
-        r2 = {k: (v if k != "links" else {a: label(b) if isinstance(b, str) else b for a, b in v.items()}) for k, v in root.items()}
-        lines.append("ROOT (full):\n" + json.dumps(r2)[:3000])
-    groups = {}
-    for lab, v in DATA.items():
-        groups.setdefault(lab.split("?")[0], []).append((lab, v))
-    for base, items in groups.items():
-        if base == "/":
-            continue
-        n = sum(len(x) if isinstance(x, list) else 0 for _, x in items)
-        lines.append(f"PATH {base}: {len(items)} responses (e.g. {items[0][0]})\n  shape: {shape(items[0][1])}\n"
-                     f"  sample: {json.dumps(items[0][1])[:1500]}\n  last: {json.dumps(items[-1][1])[:500]}")
-    SUMMARY = "\n".join(lines)
+    DF = build_df()
+    d = DF
+    mism = int(((d["qty"] * d["unit_price"] - d["amount"]).abs() > 0.011).sum())
+    SUMMARY = (
+        f"{len(DATA)} responses crawled. DataFrame `df`: {len(d)} unique orders (deduped by id, latest updated_at kept).\n"
+        f"Columns/dtypes: {dict(d.dtypes.astype(str))}\n"
+        f"Rates (USD per unit): {RATES}\n"
+        f"status values: {d['status'].value_counts().to_dict()}\n"
+        f"regions: {sorted(d['region'].unique())}\n"
+        f"products: {sorted(d['product'].unique())}\n"
+        f"currencies: {d['currency'].value_counts().to_dict()}\n"
+        f"distinct customers: {d['customer'].nunique()}\n"
+        f"created range (IST): {d['date'].min()} .. {d['date'].max()}\n"
+        f"rows where qty*unit_price != amount: {mism}\n"
+        f"nulls: {d.isna().sum().to_dict()}\n"
+        f"sample rows:\n{d.head(5).drop(columns=['created_ist','updated_ist']).to_string()}\n"
+    )
 
 
-SYSTEM = """You answer questions about an order ledger. Data is in the Python dict `data`
-(key = API path, value = parsed JSON response). pandas is imported as `pd`, `json` and `re` too.
-Write Python that computes the answer and assigns it to a variable `result`.
-Rules:
-- Flatten the paginated record lists across ALL paths; DROP duplicate records (same id).
-- Inspect field names/values from the summary. Respect status fields (e.g. cancelled/refunded),
-  currencies (convert to USD if amounts are in other currencies using any rates in the data),
-  date fields (filter by calendar month/year in the right field), and region names exactly.
-- Money: round to 2 decimals. Counts: int. Names: spelled exactly as in the data.
-- Refunds may live in a separate list or as fields on orders; check the summary.
-Return ONLY code, no markdown fences."""
+SYSTEM = """You answer questions about Acme Appliances' order ledger using a pandas DataFrame `df`
+(already cleaned: one row per order id, latest version only). Write Python that computes the answer and
+assigns it to `result`. pandas is `pd`. Return ONLY code, no markdown fences.
+Columns: id, customer, region, product, qty, unit_price, amount (in the row's own `currency`),
+currency, status (lowercase), created_at/updated_at (raw strings), created_ist/updated_ist (tz-aware Asia/Kolkata),
+month ('YYYY-MM' of created_ist), date ('YYYY-MM-DD' of created_ist), updated_month, usd (amount converted to USD).
+Business rules:
+- Revenue = sum of `usd` over rows with status == 'paid' only. Dates for a period (month, day, quarter, year)
+  use `created_ist` (columns month/date) unless the question clearly says otherwise.
+- Refunds = rows with status == 'refunded'. Refund amount = sum of `usd` for them; count = number of rows.
+  For "refunded in <period>" use the created period unless the question says when the refund happened
+  (then use updated_month / updated_ist).
+- Match region/product names case-insensitively but return product names exactly as they appear in the data.
+- Money results: float rounded to 2 decimals. Counts: int. For "top/best" questions return the name string
+  (or a number if they ask for the amount). Use `result` as a plain Python number/string (or list/dict if multiple).
+- Quantity questions ("units sold") use sum of qty over paid orders unless stated otherwise.
+"""
 
 
 def ask_llm(question, err=None):
     msgs = [{"role": "system", "content": SYSTEM},
-            {"role": "user", "content": f"DATA SUMMARY:\n{SUMMARY[:14000]}\n\nQUESTION: {question}"}]
+            {"role": "user", "content": f"DATA SUMMARY:\n{SUMMARY[:9000]}\n\nQUESTION: {question}"}]
     if err:
         msgs.append({"role": "user", "content": f"Your previous code failed: {err}\nFix it."})
     r = requests.post(f"{BASE}/chat/completions", timeout=12,
@@ -199,7 +244,7 @@ def ask_llm(question, err=None):
 
 def run(code):
     import pandas as pd
-    env = {"data": DATA, "pd": pd, "json": json, "re": re}
+    env = {"df": DF.copy(), "data": DATA, "pd": pd, "json": json, "re": re}
     exec(code, env)
     return env["result"]
 
@@ -240,7 +285,7 @@ def debug():
 @app.post("/")
 async def answer(req: Request):
     q = (await req.json()).get("question", "")
-    if not DATA:
+    if DF is None:
         load()
     err = None
     for _ in range(2):
