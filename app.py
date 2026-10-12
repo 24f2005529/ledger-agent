@@ -7,18 +7,13 @@ Env vars:
   MODEL            default gpt-4.1-mini
 Run: uvicorn app:app --host 0.0.0.0 --port 8000
 """
-import calendar, json, os, re, threading, time
-from collections import defaultdict
-from datetime import datetime
-from typing import Any
-from zoneinfo import ZoneInfo
+import json, os, re, threading
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import requests
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.concurrency import run_in_threadpool
 
 LEDGER_URL = os.environ["LEDGER_URL"]
 BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
@@ -198,7 +193,6 @@ def load():
     global DATA, SUMMARY, DF
     DATA = crawl()
     DF = build_df()
-    prep_fallback()
     d = DF
     mism = int(((d["qty"] * d["unit_price"] - d["amount"]).abs() > 0.011).sum())
     SUMMARY = (
@@ -217,463 +211,6 @@ def load():
     )
 
 
-# ---- deterministic fallback (used only if the LLM path fails or times out) ----
-BUSINESS_TZ = ZoneInfo("Asia/Kolkata")
-ORDERS, PRODUCT_NAMES = [], []
-
-
-def parse_timestamp(value: str) -> datetime:
-    """Parse a timestamp; treat naive timestamps as Kolkata-local."""
-    dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=BUSINESS_TZ)
-    return dt
-
-
-
-def usd(order: dict[str, Any]) -> float:
-    """Convert an order's amount to USD using the supplied rate table."""
-    currency = str(order["currency"]).upper()
-
-    if currency not in RATES:
-        raise ValueError(f"Unknown currency: {currency}")
-
-    return float(order["amount"]) * RATES[currency]
-
-
-def parse_period(
-    question: str,
-) -> tuple[datetime | None, datetime | None]:
-    """Return a [start, end) interval for a month/year or year."""
-    q = question.lower()
-    months: dict[str, int] = {}
-
-    for index, name in enumerate(calendar.month_name):
-        if name:
-            months[name.lower()] = index
-
-    for index, name in enumerate(calendar.month_abbr):
-        if name:
-            months[name.lower()] = index
-
-    month_pattern = "|".join(
-        re.escape(name)
-        for name in sorted(months, key=len, reverse=True)
-    )
-
-    match = re.search(rf"\b({month_pattern})\s+(20\d{{2}})\b", q)
-
-    if match:
-        month = months[match.group(1)]
-        year = int(match.group(2))
-
-        start = datetime(year, month, 1, tzinfo=BUSINESS_TZ)
-
-        if month == 12:
-            end = datetime(year + 1, 1, 1, tzinfo=BUSINESS_TZ)
-        else:
-            end = datetime(
-                year, month + 1, 1, tzinfo=BUSINESS_TZ
-            )
-
-        return start, end
-
-    match = re.search(r"\b(20\d{2})\b", q)
-
-    if match:
-        year = int(match.group(1))
-
-        return (
-            datetime(year, 1, 1, tzinfo=BUSINESS_TZ),
-            datetime(year + 1, 1, 1, tzinfo=BUSINESS_TZ),
-        )
-
-    return None, None
-
-
-def find_region(question: str) -> str | None:
-    """
-    Recognize 'from West', 'West region', 'region West',
-    and standalone region names such as 'paid Central order'.
-    """
-    q = question.lower()
-
-    patterns = (
-        r"\b(?:from|in|for|of|within|across)\s+"
-        r"(north|south|east|west|central)\b",
-
-        r"\b(north|south|east|west|central)\s+region\b",
-
-        r"\bregion\s+(north|south|east|west|central)\b",
-
-        # Keep this fallback last so explicit region phrases are preferred.
-        r"\b(north|south|east|west|central)\b",
-    )
-
-    for pattern in patterns:
-        match = re.search(pattern, q)
-        if match:
-            return match.group(1)
-
-    return None
-
-
-def rule_answer(question: str) -> Any:
-    q = question.lower().strip()
-    # "at least one", "at most 3" are thresholds, not rankings
-    q = re.sub(r"\bat\s+(?:least|most)\b", "at_threshold", q)
-
-    if not q:
-        raise ValueError("Please provide a question.")
-
-    refund_query = bool(
-        re.search(r"\brefund(?:s|ed|ing)?\b", q)
-    )
-
-    average_query = bool(
-        re.search(r"\baverage\b|\bmean\b", q)
-    )
-
-    # Count questions must ask for orders, customers, or refunds.
-    # "How many US dollars is an order worth?" is a money question,
-    # not a request to count orders.
-    count_query = bool(
-        re.search(
-            r"\bhow many\s+"
-            r"(?:(?:paid|refunded|voided?|cancelled?|canceled?|"
-            r"total|overall|distinct|unique|different|separate|individual)\s+)*"
-            r"(?:orders?|customers?|refunds?)\b",
-            q,
-        )
-        or re.search(
-            r"\b(?:count|number)\s+of\s+"
-            r"(?:(?:paid|refunded|voided?|cancelled?|canceled?|"
-            r"total|overall|distinct|unique|different|separate|individual)\s+)*"
-            r"(?:orders?|customers?|refunds?)\b",
-            q,
-        )
-        or re.search(r"\bcount\b", q)
-    )
-
-    # Detect unit/quantity questions, including "most sold" and
-    # "best-selling". Explicit monetary wording takes precedence.
-    quantity_query = bool(
-        re.search(
-            r"\b(units?|items?|quantities|quantity|qty|pieces)\b",
-            q,
-        )
-        or re.search(
-            r"\b(?:sold|selling)\s+(?:the\s+)?"
-            r"(?:most|highest|largest|greatest)\b|"
-            r"\bmost\s+sold\b|\b(?:best|top)[- ]selling\b",
-            q,
-        )
-    )
-
-    # Money questions can mention value, worth, currency, cost, or revenue.
-    money_query = bool(
-        re.search(
-            r"\b(revenue|sales|spend|spent|turnover|amount|value|"
-            r"worth|price|cost|usd|dollars?|euros?|eur|"
-            r"rupees?|inr|sum)\b",
-            q,
-        )
-    )
-
-    if money_query:
-        quantity_query = False
-
-    customer_count_query = bool(
-        re.search(
-            r"\bhow many (?:(?:different|distinct|unique|separate|individual) )?"
-            r"customers?\b|"
-            r"\b(?:number|count) of "
-            r"(?:(?:different|distinct|unique|separate|individual) )?customers?\b",
-            q,
-        )
-    )
-
-    # Identify the requested measure.
-    if count_query:
-        measure = "count"
-    elif refund_query:
-        measure = "refund"
-    elif quantity_query:
-        measure = "quantity"
-    elif average_query or money_query:
-        measure = "revenue"
-    else:
-        measure = "count"
-
-    start, end = parse_period(q)
-    region = find_region(q)
-
-    # A refund-related date normally refers to the update/event date.
-    # Explicit creation/order-date wording takes precedence.
-    if re.search(r"\b(updated|update date|last updated)\b", q):
-        date_field = "updated_at"
-    elif re.search(
-        r"\b(created|creation|placed|ordered|order date)\b", q
-    ):
-        date_field = "created_at"
-    elif refund_query:
-        date_field = "updated_at"
-    else:
-        date_field = "created_at"
-
-    product = next(
-        (p for p in PRODUCT_NAMES if p.lower() in q),
-        None,
-    )
-
-    customer_match = re.search(
-        r"\b(c\d{4})\b",
-        q,
-        re.IGNORECASE,
-    )
-
-    filtered: list[dict[str, Any]] = []
-
-    for order in ORDERS:
-        status = str(order.get("status", "")).lower()
-
-        # Revenue and sold quantities use paid orders only.
-        # Refund values use refunded orders only.
-        if measure in ("revenue", "quantity") and status != "paid":
-            continue
-
-        if measure == "refund" and status != "refunded":
-            continue
-
-        # For count questions, apply an explicit status filter.
-        if measure == "count":
-            if refund_query and status != "refunded":
-                continue
-
-            if (
-                not refund_query
-                and re.search(r"\b(?:paid|bought|purchased)\b", q)
-                and status != "paid"
-            ):
-                continue
-
-            if (
-                re.search(r"\bvoid(?:ed)?\b", q)
-                and status != "void"
-            ):
-                continue
-
-            if (
-                re.search(r"\b(?:cancelled|canceled)\b", q)
-                and status not in ("cancelled", "canceled")
-            ):
-                continue
-
-        # Apply date filters using Kolkata business time.
-        if start is not None and end is not None:
-            timestamp_value = (
-                order.get(date_field)
-                or order.get("created_at")
-            )
-
-            dt = parse_timestamp(timestamp_value).astimezone(
-                BUSINESS_TZ
-            )
-
-            if not (start <= dt < end):
-                continue
-
-        if (
-            region
-            and str(order.get("region", "")).lower() != region
-        ):
-            continue
-
-        if product and order.get("product") != product:
-            continue
-
-        if (
-            customer_match
-            and str(order.get("customer", "")).lower()
-            != customer_match.group(1).lower()
-        ):
-            continue
-
-        filtered.append(order)
-
-    # Detect requests grouped or ranked by product, customer, or region.
-    group_field = None
-
-    if re.search(
-        r"\b(?:top|bottom)\s+\d+\s+products?\b|\bby products?\b|\bper products?\b|\beach products?\b|"
-        r"\bwhich products?\b|\btop products?\b|"
-        r"\bbest[- ]selling products?\b|\bproduct[- ]wise\b",
-        q,
-    ):
-        group_field = "product"
-
-    elif re.search(
-        r"\b(?:top|bottom)\s+\d+\s+customers?\b|\bby customers?\b|\bper customers?\b|\beach customers?\b|"
-        r"\bwhich customers?\b|\btop customers?\b|"
-        r"\bhighest[- ]spending customers?\b|\bcustomer[- ]wise\b",
-        q,
-    ):
-        group_field = "customer"
-
-    elif re.search(
-        r"\b(?:top|bottom)\s+\d+\s+regions?\b|\bby regions?\b|\bper regions?\b|\beach regions?\b|"
-        r"\bwhich regions?\b|\btop regions?\b|\bregion[- ]wise\b",
-        q,
-    ):
-        group_field = "region"
-
-    rank_cue = re.search(
-        r"\b(top|highest|most|best|largest|biggest|greatest|leading|"
-        r"lowest|least|fewest|smallest|worst|bottom|"
-        r"(?:top|best)[- ]selling|best[- ]seller)\b",
-        q,
-    )
-
-    is_how_many = re.search(r"\bhow many\b|\b(?:number|count) of\b", q) and not re.search(
-        r"\b(which|who|top|most|highest|best|lowest|fewest)\b", q
-    )
-
-    if group_field is None and rank_cue and not is_how_many:
-        if re.search(r"\b(customers?|buyers?|clients?|who)\b", q):
-            if not customer_match:
-                group_field = "customer"
-        elif re.search(r"\b(regions?|territor(?:y|ies)|areas?)\b", q):
-            if not region:
-                group_field = "region"
-        elif re.search(
-            r"\b(products?|appliances?|items?|sellers?|selling)\b", q
-        ):
-            if not product:
-                group_field = "product"
-
-    def metric_for(orders: list[dict[str, Any]]) -> float:
-        if measure == "count":
-            if customer_count_query:
-                return float(
-                    len({
-                        str(o.get("customer", ""))
-                        for o in orders
-                    })
-                )
-
-            return float(len(orders))
-
-        if measure == "quantity":
-            total_quantity = sum(
-                float(o.get("qty", 0))
-                for o in orders
-            )
-
-            if average_query and orders:
-                return total_quantity / len(orders)
-
-            return total_quantity
-
-        values = [usd(o) for o in orders]
-        total = sum(values)
-
-        if average_query and values:
-            return total / len(values)
-
-        return total
-
-    if group_field:
-        buckets: dict[str, list[dict[str, Any]]] = defaultdict(list)
-
-        for order in filtered:
-            group_name = str(order.get(group_field, "Unknown"))
-            buckets[group_name].append(order)
-
-        if not buckets:
-            return {}
-
-        group_values = {
-            key: metric_for(value)
-            for key, value in buckets.items()
-        }
-
-        top_n = re.search(r"\b(?:top|bottom)\s+(\d+)\b", q)
-        wants_min = re.search(
-            r"\b(lowest|least|fewest|smallest|worst|minimum|bottom)\b",
-            q,
-        )
-        wants_max = re.search(
-            r"\b(top|highest|most|best|largest|greatest|biggest|"
-            r"maximum|leading)\b",
-            q,
-        )
-
-        if top_n or wants_min or wants_max:
-            # "Which product ...?" asks for the name itself, so return the
-            # plain name (as the API spells it), not an object with a value.
-            ordered = sorted(
-                group_values,
-                key=lambda k: (group_values[k], k),
-                reverse=not wants_min,
-            )
-
-            if top_n:
-                return ordered[: int(top_n.group(1))]
-
-            return ordered[0]
-
-        return {
-            key: (
-                int(value)
-                if measure in ("count", "quantity")
-                and float(value).is_integer()
-                else round(value, 2)
-            )
-            for key, value in sorted(group_values.items())
-        }
-
-    if not filtered:
-        return 0
-
-    if measure == "count":
-        if customer_count_query:
-            return len({
-                str(order.get("customer", ""))
-                for order in filtered
-            })
-
-        return len(filtered)
-
-    if measure == "quantity":
-        total_quantity = sum(
-            float(order.get("qty", 0))
-            for order in filtered
-        )
-
-        if average_query:
-            return round(total_quantity / len(filtered), 2)
-
-        if total_quantity.is_integer():
-            return int(total_quantity)
-
-        return round(total_quantity, 2)
-
-    total_usd = sum(usd(order) for order in filtered)
-
-    if average_query:
-        return round(total_usd / len(filtered), 2)
-
-    return round(total_usd, 2)
-
-
-
-
-def prep_fallback():
-    global ORDERS, PRODUCT_NAMES
-    ORDERS = DF.drop(columns=["created_ist", "updated_ist"]).to_dict("records")
-    PRODUCT_NAMES = sorted({str(o["product"]) for o in ORDERS if o.get("product")}, key=len, reverse=True)
-
-
 SYSTEM = """You answer questions about Acme Appliances' order ledger using a pandas DataFrame `df`
 (already cleaned: one row per order id, latest version only). Write Python that computes the answer and
 assigns it to `result`. pandas is `pd`. Return ONLY code, no markdown fences.
@@ -690,27 +227,17 @@ Business rules:
 - Money results: float rounded to 2 decimals. Counts: int. For "top/best" questions return the name string
   (or a number if they ask for the amount). Use `result` as a plain Python number/string (or list/dict if multiple).
 - Quantity questions ("units sold") use sum of qty over paid orders unless stated otherwise.
-- "at least" / "at most" / "no more than" are thresholds, NOT rankings. "How many ..." (including "how many
-  different/distinct customers ...") asks for a COUNT: return an int, e.g. df[mask]['customer'].nunique() for
-  distinct customers. "Placed a paid order for X" means status == 'paid' and product == X.
-- Ranking wording such as top, best, top-selling, best-selling, biggest, highest, most (as in "which ... most"),
-  leading, lowest, fewest means: group, rank, and return ONLY the single winning name string (customer ids look like 'C1067'),
-  unless the question asks for the amount/value too or for 'top N' (then a list of names). "Top-selling"
-  or "best seller" by revenue (or with no measure given) ranks by paid USD revenue; "units" ranks by paid qty.
-- Always set `result`. It must be a plain str/int/float/list/dict, never a Series or DataFrame.
 """
 
 
-def ask_llm(question, err=None, timeout=8):
+def ask_llm(question, err=None):
     msgs = [{"role": "system", "content": SYSTEM},
             {"role": "user", "content": f"DATA SUMMARY:\n{SUMMARY[:9000]}\n\nQUESTION: {question}"}]
     if err:
         msgs.append({"role": "user", "content": f"Your previous code failed: {err}\nFix it."})
-    r = requests.post(f"{BASE}/chat/completions", timeout=timeout,
+    r = requests.post(f"{BASE}/chat/completions", timeout=12,
                       headers={"Authorization": f"Bearer {KEY}"},
                       json={"model": MODEL, "messages": msgs, "temperature": 0})
-    if r.status_code != 200:
-        raise RuntimeError(f"LLM HTTP {r.status_code}: {r.text[:200]}")
     code = r.json()["choices"][0]["message"]["content"]
     return re.sub(r"^```(?:python)?|```$", "", code.strip(), flags=re.M).strip()
 
@@ -723,31 +250,16 @@ def run(code):
 
 
 def clean(x):
-    import pandas as pd
-    if isinstance(x, pd.DataFrame):
-        x = x.to_dict("records")
-    elif isinstance(x, pd.Series):
-        if len(x) == 1:
-            # a one-row ranking (groupby ... head(1)) means "the winner's name"
-            x = x.index[0] if not isinstance(x.index, pd.RangeIndex) else x.iloc[0]
-        else:
-            x = x.to_dict()
-    if isinstance(x, dict):
-        return {str(k): clean(v) for k, v in x.items()}
-    if isinstance(x, (list, tuple, set)):
-        return [clean(v) for v in x]
     try:
         import numpy as np
-        if isinstance(x, np.integer): return int(x)
-        if isinstance(x, np.floating): x = float(x)
-        if isinstance(x, np.bool_): return bool(x)
+        if isinstance(x, (np.integer,)): return int(x)
+        if isinstance(x, (np.floating,)): x = float(x)
     except Exception:
         pass
     if isinstance(x, float):
         return int(x) if x.is_integer() and abs(x) > 1e9 else round(x, 2)
     if hasattr(x, "tolist"): return x.tolist()
-    if isinstance(x, (str, int, bool)) or x is None: return x
-    return str(x)
+    return x
 
 
 app = FastAPI()
@@ -769,28 +281,16 @@ def debug():
     return {"summary": SUMMARY}
 
 
-def solve(q):
-    """LLM-written pandas first (within a ~12s budget); rule-based fallback otherwise."""
-    start, err = time.time(), None
-    for _ in range(2):
-        left = 12 - (time.time() - start)
-        if left < 3:
-            break
-        try:
-            return clean(run(ask_llm(q, err, timeout=min(8, left))))
-        except Exception as e:
-            err = repr(e)[:300]
-    try:
-        return clean(rule_answer(q))
-    except Exception:
-        return None
-
-
 @app.post("/answer")
 @app.post("/")
 async def answer(req: Request):
     q = (await req.json()).get("question", "")
     if DF is None:
-        await run_in_threadpool(load)
-    # run in a worker thread so simultaneous questions are answered in parallel
-    return {"answer": await run_in_threadpool(solve, q)}
+        load()
+    err = None
+    for _ in range(2):
+        try:
+            return {"answer": clean(run(ask_llm(q, err)))}
+        except Exception as e:
+            err = repr(e)[:300]
+    return {"answer": None, "error": err}
